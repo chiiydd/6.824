@@ -10,11 +10,14 @@ package main
 // Please do not change this file.
 //
 
-import "6.824/mr"
-import "plugin"
-import "os"
-import "fmt"
-import "log"
+import (
+	"fmt"
+	"log"
+	"os"
+	"plugin"
+
+	"6.824/mr"
+)
 
 func main() {
 	if len(os.Args) != 2 {
@@ -46,6 +49,5 @@ func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(strin
 		log.Fatalf("cannot find Reduce in %v", filename)
 	}
 	reducef := xreducef.(func(string, []string) string)
-
 	return mapf, reducef
 }

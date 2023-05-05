@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -101,9 +103,11 @@ func TestManyElections2A(t *testing.T) {
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
+
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
+		// DPrintf("\nDisconnect Server [%d]  [%d] [%d] !!\n", i1, i2, i3)
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
@@ -1047,6 +1051,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		if cfg.LogSize() >= MAXLOGSIZE {
 			cfg.t.Fatalf("Log size too large")
 		}
+
 		if disconnect {
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
@@ -1073,8 +1078,7 @@ func TestSnapshotInstall2D(t *testing.T) {
 }
 
 func TestSnapshotInstallUnreliable2D(t *testing.T) {
-	snapcommon(t, "Test (2D): install snapshots (disconnect+unreliable)",
-		true, false, false)
+	snapcommon(t, "Test (2D): install snapshots (disconnect+unreliable)", true, false, false)
 }
 
 func TestSnapshotInstallCrash2D(t *testing.T) {

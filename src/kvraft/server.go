@@ -1,12 +1,16 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
@@ -18,11 +22,27 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	Key      string
+	Value    string
+	Command  string
+	OpId     int64
+	ClientId int64
+}
+type ApplyNotifyMsg struct {
+	Err      Err
+	Value    string
+	ClientId int64
+	Term     int
+}
+
+type Reply struct {
+	OpId int64
+	Msg  ApplyNotifyMsg
 }
 
 type KVServer struct {
@@ -35,15 +55,118 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
 
+	db          map[string]string
+	latestReply map[int64]Reply
+	replyChan   map[int]chan ApplyNotifyMsg
+	lastApplied int
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	kv.mu.Lock()
+	if latestReply, ok := kv.latestReply[args.ClientId]; ok && latestReply.OpId >= args.OpId {
+		if latestReply.OpId == args.OpId {
+			reply.Err = latestReply.Msg.Err
+			reply.Value = latestReply.Msg.Value
+		} else {
+			reply.Value = ""
+			reply.Err = ErrOutdate
+		}
+
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Key:      args.Key,
+		Value:    "",
+		Command:  "Get",
+		ClientId: args.ClientId,
+		OpId:     args.OpId,
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	ch := make(chan ApplyNotifyMsg, 1)
+
+	kv.replyChan[index] = ch
+
+	kv.mu.Unlock()
+
+	select {
+	case replyMsg := <-ch:
+		if replyMsg.ClientId == args.ClientId && replyMsg.Term == term {
+			reply.Value = replyMsg.Value
+			reply.Err = replyMsg.Err
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+
+	case <-time.After(750 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	delete(kv.replyChan, index)
+	kv.mu.Unlock()
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	// Your code here.x
+	kv.mu.Lock()
+	if latestReply, ok := kv.latestReply[args.ClientId]; ok && latestReply.OpId >= args.OpId {
+		reply.Err = latestReply.Msg.Err
+		if latestReply.OpId > args.OpId {
+			reply.Err = ErrOutdate
+		}
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		Command:  args.Op,
+		ClientId: args.ClientId,
+		OpId:     args.OpId,
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	ch := make(chan ApplyNotifyMsg, 1)
+
+	kv.replyChan[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case replyMsg := <-ch:
+
+		if replyMsg.ClientId == args.ClientId && replyMsg.Term == term {
+			reply.Err = replyMsg.Err
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+
+	case <-time.After(750 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	delete(kv.replyChan, index)
+	kv.mu.Unlock()
 }
 
 //
@@ -60,6 +183,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+
 }
 
 func (kv *KVServer) killed() bool {
@@ -93,9 +217,153 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.latestReply = make(map[int64]Reply)
+	kv.replyChan = make(map[int]chan ApplyNotifyMsg)
+	kv.db = make(map[string]string)
+	kv.lastApplied = 0
+	go kv.notifier()
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	if kv.maxraftstate != -1 {
+		go kv.snapshotChecker()
+	}
 
 	return kv
+}
+
+func (kv *KVServer) notifier() {
+
+	for !kv.killed() {
+		select {
+		case applyMsg := <-kv.applyCh:
+			// DPrintf("[%d] receives new applyMsg %v\n", kv.me, applyMsg)
+			if applyMsg.CommandValid {
+				kv.applyCommand(applyMsg)
+			} else if applyMsg.SnapshotValid {
+				kv.applySnapshot(applyMsg)
+			} else {
+				DPrintf("[%d] receives wrong msg\n", kv.me)
+			}
+		}
+	}
+}
+
+func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	var notifyMsg ApplyNotifyMsg
+	op := msg.Command.(Op)
+	index := msg.CommandIndex
+	notifyMsg.Term = msg.CommandTerm
+	notifyMsg.ClientId = op.ClientId
+
+	// check the operation whether has been applied.
+	if reply, ok := kv.latestReply[op.ClientId]; ok && reply.OpId >= op.OpId {
+		return
+	}
+	if index <= kv.lastApplied {
+		return
+	}
+
+	kv.lastApplied = index
+
+	if op.Command == "Get" {
+		if value, ok := kv.db[op.Key]; ok {
+			notifyMsg = ApplyNotifyMsg{
+				Err:   OK,
+				Value: value,
+			}
+		} else {
+			notifyMsg = ApplyNotifyMsg{
+				Err:   ErrNoKey,
+				Value: "",
+			}
+		}
+	} else if op.Command == "Put" {
+		kv.db[op.Key] = op.Value
+		notifyMsg = ApplyNotifyMsg{
+			Err:   OK,
+			Value: "",
+		}
+	} else if op.Command == "Append" {
+		old, ok := kv.db[op.Key]
+		if ok {
+			kv.db[op.Key] = old + op.Value
+		} else {
+			kv.db[op.Key] = op.Value
+		}
+
+		notifyMsg = ApplyNotifyMsg{
+			Err:   OK,
+			Value: "",
+		}
+	}
+
+	if ch, ok := kv.replyChan[index]; ok {
+		ch <- notifyMsg
+
+		DPrintf("[%d] succeeds in dealing with command %v key %v", kv.me, op.Command, op.Key)
+		if op.Command == "Get" {
+			DPrintf("%v\n", kv.db[op.Key])
+		} else {
+			DPrintf("%v\n", op.Value)
+		}
+		// DPrintf("%v \n", kv.latestReply[op.ClientId])
+
+	}
+	kv.latestReply[op.ClientId] = Reply{
+		OpId: op.OpId,
+		Msg:  notifyMsg,
+	}
+
+}
+
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	var db map[string]string
+	var latestReply map[int64]Reply
+
+	r := bytes.NewBuffer(msg.Snapshot)
+
+	d := labgob.NewDecoder(r)
+	if d.Decode(&db) != nil || d.Decode(&latestReply) != nil {
+		fmt.Printf("[%d] decoding snapshot data fails \n", kv.me)
+		return
+	}
+
+	// update db  when the snapshot is up-to-date
+	if msg.SnapshotIndex >= kv.lastApplied {
+		DPrintf("[%d] apply Snapshot   \n", kv.me)
+		kv.lastApplied = msg.SnapshotIndex
+		kv.latestReply = latestReply
+		kv.db = db
+	}
+}
+
+func (kv *KVServer) snapshotChecker() {
+	var snapshot []byte
+	var latestIncludedIndex int
+
+	for !kv.killed() {
+		if kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			kv.mu.Lock()
+			e.Encode(kv.db)
+			e.Encode(kv.latestReply)
+			snapshot = w.Bytes()
+			latestIncludedIndex = kv.lastApplied
+			kv.mu.Unlock()
+
+			kv.rf.Snapshot(latestIncludedIndex, snapshot)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
 }
