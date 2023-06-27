@@ -265,7 +265,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if rf.killed() {
 		return
 	}
-	// rf.apply()
+
 	rf.mu.Lock()
 	DPrintf("[%d] install snapshot \n", rf.me)
 	defer rf.mu.Unlock()
@@ -362,6 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if args.PrevLogIndex < rf.snapshotIndex {
+
 		DPrintf("[%d]'s entries outdate\n", args.LeaderId)
 		return
 	}
@@ -380,19 +381,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	latestLogIndex := rf.log.latestIndex()
-	latestLogTerm := max(rf.snapshotTerm, rf.log.at(latestLogIndex).Term)
+	// latestLogTerm := max(rf.snapshotTerm, rf.log.at(latestLogIndex).Term)
 	for idx, entry := range args.Entries {
 
 		//  AppendEntries rule 3
-		if entry.Index <= latestLogIndex && entry.Term != latestLogTerm {
+		if entry.Index <= latestLogIndex && entry.Term != rf.log.at(entry.Index).Term {
 			rf.log.cutEnd(entry.Index)
 			latestLogIndex = rf.log.latestIndex()
-			latestLogTerm = max(rf.snapshotTerm, rf.log.at(latestLogIndex).Term)
+			// latestLogTerm = max(rf.snapshotTerm, rf.log.at(latestLogIndex).Term)
 		}
 		//  AppendEntries rule 4
 		if entry.Index > latestLogIndex {
 			rf.log.Log = append(rf.log.Log, args.Entries[idx:]...)
-			DPrintf("[%d] succeed receive leader [%d]'s entries\n", rf.me, args.LeaderId)
+			DPrintf("[%d] succeed receive leader [%d]'s entries,now latest log index %d\n", rf.me, args.LeaderId, rf.log.latestEntry().Index)
 			// for i := idx; i < len(args.Entries); i++ {
 			// 	DPrintf("(%d %d) ", args.Entries[i].Index, args.Entries[i].Term)
 			// }
@@ -443,6 +444,7 @@ func (rf *Raft) appendEntriesToPeer(heartbeat bool, peer int) {
 		}
 		prevIndex := rf.nextIndex[peer] - 1
 		preTerm := rf.log.at(prevIndex).Term
+
 		if preTerm == 0 {
 			preTerm = rf.snapshotTerm
 		}
@@ -589,6 +591,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	DPrintf("[%d] is now down.\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -649,7 +652,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-
 	// snapshot initial
 	rf.snapshotIndex = -1
 	rf.snapshotTerm = 0
@@ -660,6 +662,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCon = sync.NewCond(&rf.mu)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	DPrintf("[%d] is now up\n", rf.me)
 	if rf.snapshotIndex > 0 {
 		rf.commitIndex = rf.snapshotIndex
 		rf.lastApplied = rf.snapshotIndex
